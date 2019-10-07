@@ -1,4 +1,5 @@
 ﻿using System;
+using System.IO;
 
 namespace Grassfed.MurmurHash3
 {
@@ -10,12 +11,29 @@ namespace Grassfed.MurmurHash3
     ///     Project home: https://github.com/judwhite/Grassfed.MurmurHash3
     /// </para>
     /// <para>
-    ///     See https://github.com/aappleby/smhasher/wiki/MurmurHash3 for more information. Port of 
+    ///     See https://github.com/aappleby/smhasher/wiki/MurmurHash3 for more information. Port of
     ///     https://github.com/aappleby/smhasher/blob/61a0530f28277f2e850bfc39600ce61d02b518de/src/MurmurHash3.cpp#L255
     /// </para>
     /// </summary>
     public class MurmurHash3
     {
+        private const ulong c1 = 0x87c37b91114253d5;
+        private const ulong c2 = 0x4cf5ad432745937f;
+
+        private readonly byte[] tail;
+        private ulong h1;
+        private ulong h2;
+        private int tailLength;
+        private ulong totalCount;
+
+        /// <summary>
+        /// Initializes a new instance of the class.
+        /// </summary>
+        public MurmurHash3()
+        {
+            tail = new byte[16];
+        }
+
         /// <summary>Gets the size, in bits, of the computed hash code.</summary>
         /// <returns>The size, in bits, of the computed hash code.</returns>
         public int HashSize => 128;
@@ -27,7 +45,9 @@ namespace Grassfed.MurmurHash3
         /// <paramref name="buffer" /> is null.</exception>
         public byte[] ComputeHash(byte[] buffer)
         {
-            return ComputeHash(buffer, 0, buffer.Length);
+            HashRestart();
+            HashStep(buffer, 0, buffer.Length);
+            return HashFinal();
         }
 
         /// <summary>Computes the hash value for the specified region of the specified byte array.</summary>
@@ -41,26 +61,87 @@ namespace Grassfed.MurmurHash3
         /// <paramref name="buffer" /> is null.</exception>
         /// <exception cref="T:System.ArgumentOutOfRangeException">
         /// <paramref name="offset" /> is out of range. This parameter requires a non-negative number.</exception>
-        public unsafe byte[] ComputeHash(byte[] buffer, int offset, int count)
+        public byte[] ComputeHash(byte[] buffer, int offset, int count)
+        {
+            HashRestart();
+            HashStep(buffer, offset, count);
+            return HashFinal();
+        }
+
+        /// <summary>
+        /// Computes the hash value for the specified stream.
+        /// </summary>
+        /// <param name="inputStream">The input stream to compute the hash code for.</param>
+        /// <returns>The computed hash code.</returns>
+        public byte[] ComputeHash(Stream inputStream)
+        {
+            // Default the buffer size to 4K.
+            const int DEFAULT_BUFFER_LENGTH = 4096;
+            byte[] buffer = new byte[DEFAULT_BUFFER_LENGTH + 16];
+            int bytesRead;
+
+            do
+            {
+                Array.Clear(buffer, 0, 16);
+                bytesRead = inputStream.Read(buffer, 16, DEFAULT_BUFFER_LENGTH);
+
+                if (bytesRead > 0)
+                {
+                    HashStep(buffer, 16, bytesRead);
+                }
+
+            } while (bytesRead > 0);
+
+            return HashFinal();
+        }
+
+        private void HashRestart()
+        {
+            h1 = h2 = totalCount = 0;
+            tailLength = 0;
+            Array.Clear(tail, 0, 16);
+        }
+
+        private unsafe void HashStep(byte[] buffer, int offset, int count)
         {
             if (buffer == null)
+            {
                 throw new ArgumentNullException(nameof(buffer));
-            if (offset < 0)
-                throw new ArgumentOutOfRangeException(nameof(offset), offset, "offset must be >= 0");
-            if (count < 0)
-                throw new ArgumentOutOfRangeException(nameof(count), count, "count must be >= 0");
-            if (offset + count > buffer.Length)
-                throw new ArgumentException($"offset ({offset}) + count ({count}) exceed buffer length ({buffer.Length})");
+            }
 
-            const ulong c1 = 0x87c37b91114253d5;
-            const ulong c2 = 0x4cf5ad432745937f;
+            if (offset < 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(offset), offset, "offset must be >= 0");
+            }
+
+            if (count < 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(count), count, "count must be >= 0");
+            }
+
+            if (offset + count > buffer.Length)
+            {
+                throw new ArgumentException($"offset ({offset}) + count ({count}) exceed buffer length ({buffer.Length})");
+            }
+
+            totalCount += (ulong)count;
+
+            // usage of previous tail
+            if (tailLength > 0)
+            {
+                if (offset < 16)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(offset), "tail can't be injected to buffer");
+                }
+
+                offset -= tailLength;
+                count += tailLength;
+                Array.Copy(tail, 16 - tailLength, buffer, offset, tailLength);
+            }
 
             int nblocks = count / 16;
 
-            ulong h1 = 0;
-            ulong h2 = 0;
-
-            // body
+            // body of the hash
             fixed (byte* pbuffer = buffer)
             {
                 byte* pinput = pbuffer + offset;
@@ -92,74 +173,97 @@ namespace Grassfed.MurmurHash3
                     h2 += h1;
                     h2 = h2 * 5 + 0x38495ab5;
                 }
+            }
 
+            // store tail for next step
+            Array.Clear(tail, 0, 16);
+            int tailIndex = offset + nblocks * 16;
+            int afterTailIndex = offset + count;
+
+            if (tailIndex < afterTailIndex)
+            {
+                tailLength = afterTailIndex - tailIndex;
+                Array.Copy(buffer, tailIndex, tail, 16 - tailLength, tailLength);
+            }
+            else
+            {
+                tailLength = 0;
+            }
+        }
+
+        private unsafe byte[] HashFinal()
+        {
+            if (tailLength > 0)
+            {
                 // tail
-
-                k1 = 0;
-                k2 = 0;
-
-                byte* tail = pinput + nblocks * 16;
-                switch (count & 15)
+                fixed (byte* ptailBuffer = tail)
                 {
-                    case 15:
-                        k2 ^= (ulong)tail[14] << 48;
-                        goto case 14;
-                    case 14:
-                        k2 ^= (ulong)tail[13] << 40;
-                        goto case 13;
-                    case 13:
-                        k2 ^= (ulong)tail[12] << 32;
-                        goto case 12;
-                    case 12:
-                        k2 ^= (ulong)tail[11] << 24;
-                        goto case 11;
-                    case 11:
-                        k2 ^= (ulong)tail[10] << 16;
-                        goto case 10;
-                    case 10:
-                        k2 ^= (ulong)tail[9] << 8;
-                        goto case 9;
-                    case 9:
-                        k2 ^= tail[8];
-                        k2 *= c2;
-                        k2 = (k2 << 33) | (k2 >> (64 - 33)); // ROTL64(k2, 33);
-                        k2 *= c1;
-                        h2 ^= k2;
-                        goto case 8;
-                    case 8:
-                        k1 ^= (ulong)tail[7] << 56;
-                        goto case 7;
-                    case 7:
-                        k1 ^= (ulong)tail[6] << 48;
-                        goto case 6;
-                    case 6:
-                        k1 ^= (ulong)tail[5] << 40;
-                        goto case 5;
-                    case 5:
-                        k1 ^= (ulong)tail[4] << 32;
-                        goto case 4;
-                    case 4:
-                        k1 ^= (ulong)tail[3] << 24;
-                        goto case 3;
-                    case 3:
-                        k1 ^= (ulong)tail[2] << 16;
-                        goto case 2;
-                    case 2:
-                        k1 ^= (ulong)tail[1] << 8;
-                        goto case 1;
-                    case 1:
-                        k1 ^= tail[0];
-                        k1 *= c1;
-                        k1 = (k1 << 31) | (k1 >> (64 - 31)); // ROTL64(k1, 31);
-                        k1 *= c2;
-                        h1 ^= k1;
-                        break;
+                    byte* ptail = ptailBuffer + (16 - tailLength);
+                    ulong k1 = 0;
+                    ulong k2 = 0;
+
+                    switch (totalCount & 15)
+                    {
+                        case 15:
+                            k2 ^= (ulong)ptail[14] << 48;
+                            goto case 14;
+                        case 14:
+                            k2 ^= (ulong)ptail[13] << 40;
+                            goto case 13;
+                        case 13:
+                            k2 ^= (ulong)ptail[12] << 32;
+                            goto case 12;
+                        case 12:
+                            k2 ^= (ulong)ptail[11] << 24;
+                            goto case 11;
+                        case 11:
+                            k2 ^= (ulong)ptail[10] << 16;
+                            goto case 10;
+                        case 10:
+                            k2 ^= (ulong)ptail[9] << 8;
+                            goto case 9;
+                        case 9:
+                            k2 ^= ptail[8];
+                            k2 *= c2;
+                            k2 = (k2 << 33) | (k2 >> (64 - 33)); // ROTL64(k2, 33);
+                            k2 *= c1;
+                            h2 ^= k2;
+                            goto case 8;
+                        case 8:
+                            k1 ^= (ulong)ptail[7] << 56;
+                            goto case 7;
+                        case 7:
+                            k1 ^= (ulong)ptail[6] << 48;
+                            goto case 6;
+                        case 6:
+                            k1 ^= (ulong)ptail[5] << 40;
+                            goto case 5;
+                        case 5:
+                            k1 ^= (ulong)ptail[4] << 32;
+                            goto case 4;
+                        case 4:
+                            k1 ^= (ulong)ptail[3] << 24;
+                            goto case 3;
+                        case 3:
+                            k1 ^= (ulong)ptail[2] << 16;
+                            goto case 2;
+                        case 2:
+                            k1 ^= (ulong)ptail[1] << 8;
+                            goto case 1;
+                        case 1:
+                            k1 ^= ptail[0];
+                            k1 *= c1;
+                            k1 = (k1 << 31) | (k1 >> (64 - 31)); // ROTL64(k1, 31);
+                            k1 *= c2;
+                            h1 ^= k1;
+                            break;
+                    }
                 }
             }
 
             // finalization
-            h1 ^= (ulong)count;
-            h2 ^= (ulong)count;
+            h1 ^= totalCount;
+            h2 ^= totalCount;
 
             h1 += h2;
             h2 += h1;
@@ -170,15 +274,17 @@ namespace Grassfed.MurmurHash3
             h1 += h2;
             h2 += h1;
 
-            var ret = new byte[16];
-            fixed (byte* pret = ret)
+            var hash = new byte[16];
+
+            fixed (byte* pret = hash)
             {
                 var ulpret = (ulong*)pret;
 
                 ulpret[0] = Reverse(h1);
                 ulpret[1] = Reverse(h2);
             }
-            return ret;
+
+            return hash;
         }
 
         private static ulong FMix64(ulong k)
